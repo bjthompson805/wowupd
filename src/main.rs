@@ -1,13 +1,11 @@
-mod casc;
-mod cdn;
-mod install;
-mod jenkins;
-mod launch;
-mod tact;
-
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use wowupd::install::{self, State};
+use wowupd::launch;
+use wowupd::report::{Event, Reporter};
 
 /// Installs, updates and starts World of Warcraft clients from Blizzard's CDN, without the Battle.net
 /// launcher. Settings come from ~/.config/wowupd/wowupd.conf; options override them.
@@ -67,18 +65,44 @@ enum Cmd {
     Products,
 }
 
+/// Notes as lines; progress as one line rewritten in place on a terminal.
+fn terminal() -> Reporter {
+    let tty = std::io::stderr().is_terminal();
+    Arc::new(move |e| match e {
+        Event::Note(s) => eprintln!("{s}"),
+        Event::Progress(p) => {
+            let line = format!("  {:?}: {}", p.phase, p.describe());
+            if tty {
+                eprint!("\r{line}\x1b[K");
+                if p.finished {
+                    eprintln!();
+                }
+                let _ = std::io::stderr().flush();
+            } else if p.finished {
+                eprintln!("{line}");
+            }
+        }
+    })
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = launch::load()?;
-    let root = || cli.dir.clone().or(cfg.dir.clone()).context("no WoW folder: pass --dir or set dir in wowupd.conf");
-    let region = cli.region.clone().or(cfg.region.clone()).unwrap_or_else(|| "us".to_owned());
+    let mut cfg = launch::load()?;
+    if cli.dir.is_some() {
+        cfg.dir = cli.dir.clone();
+    }
+    if cli.region.is_some() {
+        cfg.region = cli.region.clone();
+    }
+    let root = || cfg.dir.clone().context("no WoW folder: pass --dir or set dir in wowupd.conf");
     let options = |b: &Build, check_only: bool| install::Options {
-        region: region.clone(),
-        locale: b.locale.clone().or(cfg.locale.clone()).unwrap_or_else(|| "enUS".to_owned()),
-        arch: b.arch.clone().or(cfg.arch.clone()).unwrap_or_else(|| if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }.to_owned()),
+        region: cfg.region(),
+        locale: b.locale.clone().unwrap_or_else(|| cfg.locale()),
+        arch: b.arch.clone().unwrap_or_else(|| cfg.arch()),
         jobs: b.jobs,
         check_only,
         verify: b.verify,
+        report: terminal(),
     };
     match &cli.cmd {
         Cmd::Products => {
@@ -86,12 +110,24 @@ fn main() -> Result<()> {
                 println!("{:<16} {:<16} {}", p.code, p.folder, p.name);
             }
         }
-        Cmd::Status => install::status(&root()?, &region)?,
+        Cmd::Status => {
+            let root = root()?;
+            for p in install::PRODUCTS {
+                let s = install::product_status(&root, p, &cfg.region(), &cfg.arch());
+                let state = match &s.state {
+                    State::UpToDate => "up to date".to_owned(),
+                    State::UpdateAvailable => "update available".to_owned(),
+                    State::NotInstalled => "not installed".to_owned(),
+                    State::Unknown(e) => format!("live version unknown: {e}"),
+                };
+                let (installed, live) = (s.installed.as_deref().unwrap_or("-"), s.live.as_deref().unwrap_or("?"));
+                println!("{:<24} {:<16} installed {installed:<16} live {live:<16} {state}", p.name, p.code);
+            }
+        }
         Cmd::Update { products, build, check } => {
             let opts = options(build, *check);
-            let root = root()?;
             let products = products.iter().map(|c| install::product(c)).collect::<Result<Vec<_>>>()?;
-            install::update(&root, &products, &opts)?;
+            install::update(&root()?, &products, &opts)?;
         }
         Cmd::Play { product, build, offline } => {
             let opts = options(build, false);
@@ -100,6 +136,7 @@ fn main() -> Result<()> {
             if !offline {
                 install::update(&root, &[p], &opts)?;
             }
+            eprintln!("starting {}", p.name);
             launch::play(&root, p, &opts.arch, &cfg)?;
         }
     }

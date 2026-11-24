@@ -4,7 +4,7 @@ use crate::install::{Product, local_path};
 use anyhow::{Context, Result, bail};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// `key = value` lines; `#` starts a comment. `env` may repeat.
 #[derive(Default)]
@@ -16,6 +16,21 @@ pub struct Config {
     pub wine: Option<String>,
     pub wineprefix: Option<PathBuf>,
     pub env: Vec<(String, String)>,
+}
+
+impl Config {
+    pub fn region(&self) -> String {
+        self.region.clone().unwrap_or_else(|| "us".to_owned())
+    }
+
+    pub fn locale(&self) -> String {
+        self.locale.clone().unwrap_or_else(|| "enUS".to_owned())
+    }
+
+    /// Default: this machine's.
+    pub fn arch(&self) -> String {
+        self.arch.clone().unwrap_or_else(|| if cfg!(target_arch = "aarch64") { "arm64" } else { "x86_64" }.to_owned())
+    }
 }
 
 pub fn config_path() -> Option<PathBuf> {
@@ -65,9 +80,23 @@ fn executables(arch: &str) -> &'static [&'static str] {
     }
 }
 
-/// Replaces this process with the game under Wine. Battle.net's Agent is kept from starting: the
-/// client would launch it, and it isn't needed.
+/// Replaces this process with the game under Wine.
 pub fn play(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
+    let mut cmd = command(root, p, arch, cfg)?;
+    Err(cmd.exec()).context("could not start Wine")
+}
+
+/// Starts the game under Wine in its own session, so it outlives the caller.
+pub fn spawn(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
+    let mut cmd = command(root, p, arch, cfg)?;
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
+    cmd.spawn().context("could not start Wine")?;
+    Ok(())
+}
+
+/// The Wine command for the game. Battle.net's Agent is kept from starting: the client would launch it,
+/// and it isn't needed.
+fn command(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<Command> {
     let dir = root.join(p.folder);
     let exe = executables(arch)
         .iter()
@@ -102,6 +131,5 @@ pub fn play(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
         }
     }
     cmd.env("WINEDLLOVERRIDES", overrides);
-    eprintln!("starting {} in {}", exe.display(), dir.display());
-    Err(cmd.exec()).context("could not start Wine")
+    Ok(cmd)
 }

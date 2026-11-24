@@ -3,15 +3,14 @@
 
 use crate::casc::{Segment, Storage};
 use crate::cdn::{Cdn, Live, live};
+use crate::report::{Event, Meter, Phase, Reporter};
 use crate::tact::{self, Hash, blte_decode, blte_key_matches, hex, md5, unhex};
 use anyhow::{Context, Result, bail};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
 
 pub struct Product {
     pub code: &'static str,
@@ -42,6 +41,11 @@ pub struct Options {
     pub check_only: bool,
     /// Check every blob even when the version is current.
     pub verify: bool,
+    pub report: Reporter,
+}
+
+fn note(report: &Reporter, s: impl Into<String>) {
+    report(Event::Note(s.into()));
 }
 
 /// Reads a config from `Data/config`, or fetches it and keeps it there. Configs are named by their MD5.
@@ -150,43 +154,15 @@ fn requests(missing: &HashMap<Hash, Source>) -> Vec<Job> {
     jobs
 }
 
-struct Progress {
-    done: AtomicU64,
-    total: u64,
-    started: Instant,
-    tty: bool,
-}
-
-impl Progress {
-    fn show(&self, last: bool) {
-        let done = self.done.load(Ordering::Relaxed);
-        let secs = self.started.elapsed().as_secs_f64().max(0.001);
-        let line = format!(
-            "  {:.2} / {:.2} GiB  {:.1} MiB/s",
-            done as f64 / (1u64 << 30) as f64,
-            self.total as f64 / (1u64 << 30) as f64,
-            done as f64 / secs / (1u64 << 20) as f64
-        );
-        if self.tty {
-            eprint!("\r{line}  ");
-            if last {
-                eprintln!();
-            }
-        } else if last {
-            eprintln!("{line}");
-        }
-    }
-}
-
 /// Downloads `missing` into new segments of `storage`, `jobs` requests at a time.
-fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<Hash, Source>, jobs: usize) -> Result<Storage> {
+fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<Hash, Source>, jobs: usize, report: &Reporter) -> Result<Storage> {
     let work = Mutex::new(requests(missing));
     let total = missing.values().map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
-    let progress = Progress { done: AtomicU64::new(0), total, started: Instant::now(), tty: std::io::stderr().is_terminal() };
+    let done = AtomicU64::new(0);
+    let meter = Mutex::new(Meter::new(Phase::Downloading, total));
     let storage = Mutex::new(storage);
     let failed = AtomicBool::new(false);
     let errors = Mutex::new(Vec::<String>::new());
-    let last_shown = Mutex::new(Instant::now());
     std::thread::scope(|s| {
         for _ in 0..jobs.max(1) {
             s.spawn(|| {
@@ -215,18 +191,14 @@ fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<
                             }
                             seg.as_mut().unwrap().append(&ekey, b)?;
                             if job.archive.is_none() {
-                                progress.done.fetch_add(b.len() as u64, Ordering::Relaxed);
+                                done.fetch_add(b.len() as u64, Ordering::Relaxed);
                             }
                         }
                         if job.archive.is_some() {
-                            progress.done.fetch_add(job.blobs.iter().map(|b| b.2).sum(), Ordering::Relaxed);
+                            done.fetch_add(job.blobs.iter().map(|b| b.2).sum(), Ordering::Relaxed);
                         }
                         storage.lock().unwrap().commit(seg.as_mut().unwrap())?;
-                        let mut t = last_shown.lock().unwrap();
-                        if t.elapsed().as_secs() >= 2 {
-                            progress.show(false);
-                            *t = Instant::now();
-                        }
+                        meter.lock().unwrap().update(done.load(Ordering::Relaxed), report);
                     }
                 })();
                 if let Some(mut s) = seg {
@@ -239,7 +211,7 @@ fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<
             });
         }
     });
-    progress.show(true);
+    meter.into_inner().unwrap().finish(done.load(Ordering::Relaxed), report);
     let errors = errors.into_inner().unwrap();
     if let Some(e) = errors.first() {
         bail!("download failed ({} errors; finished blobs are kept, rerun to resume): {e}", errors.len());
@@ -248,7 +220,7 @@ fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<
 }
 
 /// Finds each missing blob in the CDN archive indices, fetching the indices into `Data/indices`.
-fn locate(cdn: &Cdn, data: &Path, cdn_cfg: &HashMap<String, Vec<String>>, wanted: &HashSet<Hash>, jobs: usize) -> Result<(Vec<String>, HashMap<Hash, Source>)> {
+fn locate(cdn: &Cdn, data: &Path, cdn_cfg: &HashMap<String, Vec<String>>, wanted: &HashSet<Hash>, jobs: usize, report: &Reporter) -> Result<(Vec<String>, HashMap<Hash, Source>)> {
     let archives = cdn_cfg.get("archives").cloned().unwrap_or_default();
     let dir = data.join("indices");
     fs::create_dir_all(&dir)?;
@@ -304,7 +276,7 @@ fn locate(cdn: &Cdn, data: &Path, cdn_cfg: &HashMap<String, Vec<String>>, wanted
     }
     let n = fetched.load(Ordering::Relaxed);
     if n > 0 {
-        eprintln!("  fetched {n} archive indices");
+        note(report, format!("fetched {n} archive indices"));
     }
     Ok((archives, found.into_inner().unwrap()))
 }
@@ -433,7 +405,7 @@ fn plan(root: &Path, p: &'static Product, live: Live, opts: &Options, source: &S
             needed.extend(unhex(&v[1]).ok());
         }
     }
-    eprintln!("  {}: {} blobs, {} loose files", p.code, needed.len(), files.len());
+    note(&opts.report, format!("{}: {} blobs, {} loose files", p.code, needed.len(), files.len()));
     Ok(Plan { p, live, cdn, cdn_cfg, needed, files, file_ekeys })
 }
 
@@ -460,9 +432,9 @@ pub fn update(root: &Path, products: &[&'static Product], opts: &Options) -> Res
     for &p in products {
         let live = live(p.code, &opts.region)?;
         let installed = installed_version(root, p.code);
-        eprintln!("{} ({}): live {}, installed {}", p.name, p.code, live.version, installed.as_deref().unwrap_or("none"));
+        note(&opts.report, format!("{}: live {}, installed {}", p.name, live.version, installed.as_deref().unwrap_or("none")));
         if ours && is_current(root, p, &live, opts) && !opts.verify {
-            eprintln!("  up to date");
+            note(&opts.report, format!("{} is up to date", p.name));
             continue;
         }
         todo.push((p, live));
@@ -477,13 +449,13 @@ pub fn update(root: &Path, products: &[&'static Product], opts: &Options) -> Res
         // The new store must hold every product the folder has, not just the ones asked for.
         for p in PRODUCTS {
             if !todo.iter().any(|(t, _)| t.code == p.code) && installed_version(root, p.code).is_some() {
-                eprintln!("{} ({}): installed, so it moves into the new store too", p.name, p.code);
+                note(&opts.report, format!("{} is installed, so it moves into the new store too", p.name));
                 todo.push((p, live(p.code, &opts.region)?));
             }
         }
     }
     let source = Storage::open(&store_dir)?;
-    eprintln!("storage: {} entries{}", source.entries.len(), if ours { "" } else { " (Battle.net's; wowupd will build its own)" });
+    note(&opts.report, format!("storage: {} entries{}", source.entries.len(), if ours { "" } else { " (Battle.net's; wowupd will build its own)" }));
     let plans = todo.into_iter().map(|(p, live)| plan(root, p, live, opts, &source)).collect::<Result<Vec<_>>>()?;
     let mut wanted: HashSet<Hash> = HashSet::new();
     for pl in &plans {
@@ -493,16 +465,16 @@ pub fn update(root: &Path, products: &[&'static Product], opts: &Options) -> Res
 
     let store = if ours {
         let missing: HashSet<Hash> = wanted.iter().filter(|k| !source.has(k)).copied().collect();
-        eprintln!("{} blobs to fetch", missing.len());
+        note(&opts.report, format!("{} blobs to fetch", missing.len()));
         let Some(store) = fetch(root, source, &plans, &missing, opts)? else { return Ok(false) };
         store
     } else {
         let mut fresh = Storage::open(&data.join(NEW_STORE))?;
         let copy: Vec<Hash> = wanted.iter().filter(|k| !fresh.has(k) && source.has(k)).copied().collect();
         let missing: HashSet<Hash> = wanted.iter().filter(|k| !fresh.has(k) && !source.has(k)).copied().collect();
-        eprintln!("new store: {} blobs to copy from the old one, {} to fetch", copy.len(), missing.len());
+        note(&opts.report, format!("new store: {} blobs to copy from the old one, {} to fetch", copy.len(), missing.len()));
         if !opts.check_only {
-            copy_blobs(&source, &mut fresh, &copy)?;
+            copy_blobs(&source, &mut fresh, &copy, &opts.report)?;
         }
         let Some(mut fresh) = fetch(root, fresh, &plans, &missing, opts)? else { return Ok(false) };
         fresh.finish()?;
@@ -510,7 +482,7 @@ pub fn update(root: &Path, products: &[&'static Product], opts: &Options) -> Res
         fs::rename(&store_dir, data.join(OLD_STORE))?;
         fs::rename(data.join(NEW_STORE), &store_dir)?;
         fs::write(root.join(STORE_MARKER), "Data/data was built by wowupd\n")?;
-        eprintln!("the Battle.net store is now {}; delete it when everything works", data.join(OLD_STORE).display());
+        note(&opts.report, format!("the Battle.net store is now {}; delete it when everything works", data.join(OLD_STORE).display()));
         Storage::open(&store_dir)?
     };
 
@@ -530,7 +502,7 @@ fn fetch(root: &Path, mut store: Storage, plans: &[Plan], missing: &HashSet<Hash
         if left.is_empty() {
             break;
         }
-        let (archives, sources) = locate(&pl.cdn, &data, &pl.cdn_cfg, &left, opts.jobs)?;
+        let (archives, sources) = locate(&pl.cdn, &data, &pl.cdn_cfg, &left, opts.jobs, &opts.report)?;
         left.retain(|k| !sources.contains_key(k));
         found.push((pl, archives, sources));
     }
@@ -541,23 +513,27 @@ fn fetch(root: &Path, mut store: Storage, plans: &[Plan], missing: &HashSet<Hash
     let bytes: u64 = found.iter().flat_map(|f| f.2.values()).map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
     let loose = found.iter().flat_map(|f| f.2.values()).filter(|s| matches!(s, Source::Loose)).count();
     if !missing.is_empty() {
-        eprintln!("download: {:.2} GiB from archives, plus {loose} loose blobs", bytes as f64 / (1u64 << 30) as f64);
+        note(&opts.report, format!("download: {:.2} GiB from archives, plus {loose} loose blobs", bytes as f64 / (1u64 << 30) as f64));
     }
     if opts.check_only {
         return Ok(None);
     }
     for (pl, archives, sources) in found {
-        store = download(&pl.cdn, store, &archives, &sources, opts.jobs)?;
+        store = download(&pl.cdn, store, &archives, &sources, opts.jobs, &opts.report)?;
     }
     store.finish()?;
     Ok(Some(store))
 }
 
 /// Copies blobs between stores, keeping their bytes.
-fn copy_blobs(from: &Storage, to: &mut Storage, keys: &[Hash]) -> Result<()> {
-    let progress = Progress { done: AtomicU64::new(0), total: 0, started: Instant::now(), tty: std::io::stderr().is_terminal() };
+fn copy_blobs(from: &Storage, to: &mut Storage, keys: &[Hash], report: &Reporter) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let total = keys.iter().filter_map(|k| from.entries.get(&crate::casc::key9(k))).map(|l| l.size as u64).sum();
+    let mut meter = Meter::new(Phase::Copying, total);
+    let mut done = 0u64;
     let mut seg = to.new_segment()?;
-    let mut last = Instant::now();
     for (i, k) in keys.iter().enumerate() {
         let b = from.read(k)?;
         if !seg.fits(b.len()) {
@@ -565,19 +541,14 @@ fn copy_blobs(from: &Storage, to: &mut Storage, keys: &[Hash]) -> Result<()> {
             seg = to.new_segment()?;
         }
         seg.append(k, &b)?;
-        progress.done.fetch_add(b.len() as u64, Ordering::Relaxed);
+        done += b.len() as u64;
         if i % 20000 == 19999 {
             to.commit(&mut seg)?;
         }
-        if last.elapsed().as_secs() >= 2 {
-            eprint!("\r  copied {} of {} blobs, {:.2} GiB  ", i + 1, keys.len(), progress.done.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64);
-            last = Instant::now();
-        }
+        meter.update(done, report);
     }
     to.commit(&mut seg)?;
-    if !keys.is_empty() {
-        eprintln!("\r  copied {} blobs, {:.2} GiB          ", keys.len(), progress.done.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64);
-    }
+    meter.finish(done, report);
     Ok(())
 }
 
@@ -599,26 +570,43 @@ fn install_files(root: &Path, pl: &Plan, store: &Storage, opts: &Options) -> Res
         written += 1;
     }
     if written > 0 {
-        eprintln!("  wrote {written} loose files to {}", dir.display());
+        note(&opts.report, format!("wrote {written} loose files to {}", dir.display()));
     }
     write_atomic(&dir.join(".flavor.info"), format!("Product Flavor!STRING:0\n{}\n", pl.p.code).as_bytes())?;
     write_build_info(root, &pl.live, opts, &pl.live.build_config)?;
-    eprintln!("{} is at {}", pl.p.name, pl.live.version);
+    note(&opts.report, format!("{} is at {}", pl.p.name, pl.live.version));
     Ok(())
 }
 
-pub fn status(root: &Path, region: &str) -> Result<()> {
-    for p in PRODUCTS {
-        let installed = installed_version(root, p.code);
-        let folder = root.join(p.folder).is_dir();
-        let live = live(p.code, region).map(|l| l.version).unwrap_or_else(|e| format!("? ({e})"));
-        let state = match &installed {
-            Some(v) if *v == live => "up to date",
-            Some(_) => "update available",
-            None if folder => "folder present, not in .build.info",
-            None => "not installed",
-        };
-        println!("{:<24} {:<16} installed {:<16} live {:<16} {state}", p.name, p.code, installed.as_deref().unwrap_or("-"), live);
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    UpToDate,
+    UpdateAvailable,
+    NotInstalled,
+    /// The live version couldn't be read.
+    Unknown(String),
+}
+
+pub struct ProductStatus {
+    pub product: &'static Product,
+    pub installed: Option<String>,
+    pub live: Option<String>,
+    pub state: State,
+}
+
+/// One product's installed and live versions (asks the version service).
+pub fn product_status(root: &Path, p: &'static Product, region: &str, arch: &str) -> ProductStatus {
+    let installed = installed_version(root, p.code);
+    match live(p.code, region) {
+        Err(e) => ProductStatus { product: p, installed, live: None, state: State::Unknown(format!("{e:#}")) },
+        Ok(l) => {
+            let same_arch = build_info_row(root, p.code).and_then(|r| r.get("Tags").cloned()).is_some_and(|t| t.starts_with(&format!("Windows {arch} ")));
+            let state = match &installed {
+                None => State::NotInstalled,
+                Some(v) if *v == l.version && same_arch => State::UpToDate,
+                Some(_) => State::UpdateAvailable,
+            };
+            ProductStatus { product: p, installed, live: Some(l.version), state }
+        }
     }
-    Ok(())
 }
