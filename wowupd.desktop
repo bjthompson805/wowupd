@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=wowupd
+GenericName=World of Warcraft updater
+Comment=Install, update and play World of Warcraft without the Battle.net launcher
+Exec=wowupd-gtk
+Icon=applications-games
+Categories=Game;
+Terminal=false

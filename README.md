@@ -27,9 +27,16 @@ When Blizzard's Agent is installed, the client starts it. `wowupd play` stops it
 ## Building
 
 ```sh
-cargo build --release
-install -m 755 target/release/wowupd ~/.local/bin/
+cargo build --release                     # needs gtk4; --no-default-features builds only the command
+install -m 755 target/release/wowupd target/release/wowupd-gtk ~/.local/bin/
+install -m 644 wowupd.desktop ~/.local/share/applications/
 ```
+
+## The window
+
+`wowupd-gtk` lists each game with its installed and live versions and a **Play**, **Update** or
+**Install** button. While it works, a progress bar shows how much is done, the download speed and
+the time left. The folder button picks the World of Warcraft folder and saves it to `wowupd.conf`.
 
 ## Settings
 

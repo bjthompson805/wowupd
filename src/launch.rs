@@ -45,6 +45,17 @@ fn expand(v: &str) -> PathBuf {
     }
 }
 
+/// Sets `dir` in the config file, keeping its other lines.
+pub fn save_dir(dir: &Path) -> Result<()> {
+    let path = config_path().context("no home directory")?;
+    let old = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut lines: Vec<String> = old.lines().filter(|l| l.split('=').next().is_none_or(|k| k.trim() != "dir")).map(str::to_owned).collect();
+    lines.insert(0, format!("dir = {}", dir.display()));
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    std::fs::write(&path, lines.join("\n") + "\n")?;
+    Ok(())
+}
+
 pub fn load() -> Result<Config> {
     let mut c = Config::default();
     let Some(path) = config_path() else { return Ok(c) };
