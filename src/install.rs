@@ -119,7 +119,7 @@ struct Job {
 const MERGE_GAP: u64 = 256 * 1024;
 const MAX_REQUEST: u64 = 32 * 1024 * 1024;
 
-fn plan(missing: &HashMap<Hash, Source>) -> Vec<Job> {
+fn requests(missing: &HashMap<Hash, Source>) -> Vec<Job> {
     let mut by_archive: HashMap<usize, Vec<(Hash, u64, u64)>> = HashMap::new();
     let mut jobs = Vec::new();
     for (k, s) in missing {
@@ -180,7 +180,7 @@ impl Progress {
 
 /// Downloads `missing` into new segments of `storage`, `jobs` requests at a time.
 fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<Hash, Source>, jobs: usize) -> Result<Storage> {
-    let work = Mutex::new(plan(missing));
+    let work = Mutex::new(requests(missing));
     let total = missing.values().map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
     let progress = Progress { done: AtomicU64::new(0), total, started: Instant::now(), tty: std::io::stderr().is_terminal() };
     let storage = Mutex::new(storage);
@@ -306,11 +306,7 @@ fn locate(cdn: &Cdn, data: &Path, cdn_cfg: &HashMap<String, Vec<String>>, wanted
     if n > 0 {
         eprintln!("  fetched {n} archive indices");
     }
-    let mut found = found.into_inner().unwrap();
-    for k in wanted {
-        found.entry(*k).or_insert(Source::Loose);
-    }
-    Ok((archives, found))
+    Ok((archives, found.into_inner().unwrap()))
 }
 
 fn region_tags(region: &str) -> String {
@@ -368,18 +364,34 @@ fn pair(cfg: &HashMap<String, Vec<String>>, key: &str) -> Result<(Hash, Option<H
     Ok((unhex(&v[0])?, v.get(1).map(|s| unhex(s)).transpose()?))
 }
 
-/// Brings `p` up to date; returns whether anything changed. Unless `opts.verify`, a product whose
-/// `.build.info` row already names the live version and architecture is taken as current.
-pub fn update(root: &Path, p: &Product, opts: &Options) -> Result<bool> {
-    let live = live(p.code, &opts.region)?;
-    let row = build_info_row(root, p.code);
-    let installed = row.as_ref().and_then(|r| r.get("Version").cloned());
-    let same_arch = row.as_ref().and_then(|r| r.get("Tags")).is_some_and(|t| t.starts_with(&format!("Windows {} ", opts.arch)));
-    eprintln!("{} ({}): live {}, installed {}", p.name, p.code, live.version, installed.as_deref().unwrap_or("none"));
-    if installed.as_deref() == Some(live.version.as_str()) && same_arch && !opts.verify {
-        eprintln!("  up to date");
-        return Ok(false);
+/// What one product's live build needs.
+struct Plan {
+    p: &'static Product,
+    live: Live,
+    cdn: Cdn,
+    cdn_cfg: HashMap<String, Vec<String>>,
+    /// Blobs the client reads from storage.
+    needed: HashSet<Hash>,
+    files: Vec<tact::InstallFile>,
+    file_ekeys: HashMap<Hash, Hash>,
+}
+
+impl Plan {
+    /// Loose files whose copy in the product folder is missing or stale, as encoding keys.
+    fn stale_files(&self, root: &Path) -> Result<HashSet<Hash>> {
+        let dir = root.join(self.p.folder);
+        let mut stale = HashSet::new();
+        for f in &self.files {
+            if !fs::read(local_path(&dir, &f.path)).is_ok_and(|b| md5(&b) == f.ckey) {
+                stale.insert(*self.file_ekeys.get(&f.ckey).with_context(|| format!("{}: not in encoding", f.path))?);
+            }
+        }
+        Ok(stale)
     }
+}
+
+/// Reads the build's manifests (from `source` where it has them, else the CDN) and works out what it needs.
+fn plan(root: &Path, p: &'static Product, live: Live, opts: &Options, source: &Storage) -> Result<Plan> {
     let cdn = Cdn::new(&live);
     let data = root.join("Data");
     let build_cfg = tact::parse_config(&String::from_utf8_lossy(&config(&cdn, &data, &live.build_config)?));
@@ -387,8 +399,7 @@ pub fn update(root: &Path, p: &Product, opts: &Options) -> Result<bool> {
     if !live.key_ring.is_empty() {
         config(&cdn, &data, &live.key_ring)?;
     }
-    let mut storage = Storage::open(&data.join("data"))?;
-    eprintln!("  storage: {} entries", storage.entries.len());
+    let storage = source;
 
     let wanted_tags = vec!["Windows".to_owned(), opts.arch.clone(), opts.locale.clone(), opts.region.to_uppercase(), "speech".to_owned(), "text".to_owned()];
     let (_, enc_ekey) = pair(&build_cfg, "encoding")?;
@@ -422,50 +433,178 @@ pub fn update(root: &Path, p: &Product, opts: &Options) -> Result<bool> {
             needed.extend(unhex(&v[1]).ok());
         }
     }
-    needed.extend(file_ekeys.values().copied());
-    // The Agent keeps loose files only in the product folder; a matching copy there counts.
-    let dir = root.join(p.folder);
-    let current_files: HashSet<Hash> = files
-        .iter()
-        .filter(|f| fs::read(local_path(&dir, &f.path)).is_ok_and(|b| md5(&b) == f.ckey))
-        .filter_map(|f| file_ekeys.get(&f.ckey).copied())
-        .collect();
-    let missing: HashSet<Hash> = needed.iter().filter(|k| !current_files.contains(*k) &&!storage.has(k)).copied().collect();
-    eprintln!("  {} blobs in this build, {} to fetch; {} loose files", needed.len(), missing.len(), files.len());
-    if missing.is_empty() && opts.check_only {
+    eprintln!("  {}: {} blobs, {} loose files", p.code, needed.len(), files.len());
+    Ok(Plan { p, live, cdn, cdn_cfg, needed, files, file_ekeys })
+}
+
+/// In the WoW folder once wowupd has built `Data/data` itself. The client rejects a Battle.net store
+/// with wowupd's segments mixed in ("Missing segment header ... repair needed"), but accepts one built
+/// whole, so wowupd adopts an existing store by copying it into a fresh one.
+const STORE_MARKER: &str = ".wowupd-store";
+/// Where a Battle.net store goes once adopted, until its owner removes it.
+const OLD_STORE: &str = "data.battlenet";
+const NEW_STORE: &str = "data.wowupd";
+
+fn is_current(root: &Path, p: &Product, live: &Live, opts: &Options) -> bool {
+    let Some(row) = build_info_row(root, p.code) else { return false };
+    row.get("Version") == Some(&live.version) && row.get("Tags").is_some_and(|t| t.starts_with(&format!("Windows {} ", opts.arch)))
+}
+
+/// Brings `products` up to their live builds; returns whether anything changed. Unless `opts.verify`,
+/// a product whose `.build.info` row names the live version and architecture is taken as current.
+pub fn update(root: &Path, products: &[&'static Product], opts: &Options) -> Result<bool> {
+    let data = root.join("Data");
+    let store_dir = data.join("data");
+    let ours = root.join(STORE_MARKER).exists() || !store_dir.exists();
+    let mut todo = Vec::new();
+    for &p in products {
+        let live = live(p.code, &opts.region)?;
+        let installed = installed_version(root, p.code);
+        eprintln!("{} ({}): live {}, installed {}", p.name, p.code, live.version, installed.as_deref().unwrap_or("none"));
+        if ours && is_current(root, p, &live, opts) && !opts.verify {
+            eprintln!("  up to date");
+            continue;
+        }
+        todo.push((p, live));
+    }
+    if todo.is_empty() {
         return Ok(false);
     }
-    if !missing.is_empty() {
-        let (archives, sources) = locate(&cdn, &data, &cdn_cfg, &missing, opts.jobs)?;
-        let bytes: u64 = sources.values().map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
-        let loose = sources.values().filter(|s| matches!(s, Source::Loose)).count();
-        eprintln!("  download: {:.2} GiB from archives, plus {loose} loose blobs", bytes as f64 / (1u64 << 30) as f64);
-        if opts.check_only {
-            return Ok(false);
+    if !ours {
+        if data.join(OLD_STORE).exists() {
+            bail!("{} already exists; remove it (an earlier adopted Battle.net store) first", data.join(OLD_STORE).display());
         }
-        storage = download(&cdn, storage, &archives, &sources, opts.jobs)?;
+        // The new store must hold every product the folder has, not just the ones asked for.
+        for p in PRODUCTS {
+            if !todo.iter().any(|(t, _)| t.code == p.code) && installed_version(root, p.code).is_some() {
+                eprintln!("{} ({}): installed, so it moves into the new store too", p.name, p.code);
+                todo.push((p, live(p.code, &opts.region)?));
+            }
+        }
     }
-    storage.finish()?;
+    let source = Storage::open(&store_dir)?;
+    eprintln!("storage: {} entries{}", source.entries.len(), if ours { "" } else { " (Battle.net's; wowupd will build its own)" });
+    let plans = todo.into_iter().map(|(p, live)| plan(root, p, live, opts, &source)).collect::<Result<Vec<_>>>()?;
+    let mut wanted: HashSet<Hash> = HashSet::new();
+    for pl in &plans {
+        wanted.extend(pl.needed.iter().copied());
+        wanted.extend(pl.stale_files(root)?);
+    }
 
+    let store = if ours {
+        let missing: HashSet<Hash> = wanted.iter().filter(|k| !source.has(k)).copied().collect();
+        eprintln!("{} blobs to fetch", missing.len());
+        let Some(store) = fetch(root, source, &plans, &missing, opts)? else { return Ok(false) };
+        store
+    } else {
+        let mut fresh = Storage::open(&data.join(NEW_STORE))?;
+        let copy: Vec<Hash> = wanted.iter().filter(|k| !fresh.has(k) && source.has(k)).copied().collect();
+        let missing: HashSet<Hash> = wanted.iter().filter(|k| !fresh.has(k) && !source.has(k)).copied().collect();
+        eprintln!("new store: {} blobs to copy from the old one, {} to fetch", copy.len(), missing.len());
+        if !opts.check_only {
+            copy_blobs(&source, &mut fresh, &copy)?;
+        }
+        let Some(mut fresh) = fetch(root, fresh, &plans, &missing, opts)? else { return Ok(false) };
+        fresh.finish()?;
+        drop(source);
+        fs::rename(&store_dir, data.join(OLD_STORE))?;
+        fs::rename(data.join(NEW_STORE), &store_dir)?;
+        fs::write(root.join(STORE_MARKER), "Data/data was built by wowupd\n")?;
+        eprintln!("the Battle.net store is now {}; delete it when everything works", data.join(OLD_STORE).display());
+        Storage::open(&store_dir)?
+    };
+
+    for pl in &plans {
+        install_files(root, pl, &store, opts)?;
+    }
+    Ok(true)
+}
+
+/// Downloads `missing` into `store` and writes its indices; None in check mode.
+fn fetch(root: &Path, mut store: Storage, plans: &[Plan], missing: &HashSet<Hash>, opts: &Options) -> Result<Option<Storage>> {
+    let data = root.join("Data");
+    let mut left = missing.clone();
+    // Each build's CDN config lists its own archives; look in each in turn.
+    let mut found = Vec::new();
+    for pl in plans {
+        if left.is_empty() {
+            break;
+        }
+        let (archives, sources) = locate(&pl.cdn, &data, &pl.cdn_cfg, &left, opts.jobs)?;
+        left.retain(|k| !sources.contains_key(k));
+        found.push((pl, archives, sources));
+    }
+    if let (Some(first), false) = (plans.first(), left.is_empty()) {
+        // Not in any archive: try them as loose CDN files.
+        found.push((first, Vec::new(), left.iter().map(|k| (*k, Source::Loose)).collect()));
+    }
+    let bytes: u64 = found.iter().flat_map(|f| f.2.values()).map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
+    let loose = found.iter().flat_map(|f| f.2.values()).filter(|s| matches!(s, Source::Loose)).count();
+    if !missing.is_empty() {
+        eprintln!("download: {:.2} GiB from archives, plus {loose} loose blobs", bytes as f64 / (1u64 << 30) as f64);
+    }
+    if opts.check_only {
+        return Ok(None);
+    }
+    for (pl, archives, sources) in found {
+        store = download(&pl.cdn, store, &archives, &sources, opts.jobs)?;
+    }
+    store.finish()?;
+    Ok(Some(store))
+}
+
+/// Copies blobs between stores, keeping their bytes.
+fn copy_blobs(from: &Storage, to: &mut Storage, keys: &[Hash]) -> Result<()> {
+    let progress = Progress { done: AtomicU64::new(0), total: 0, started: Instant::now(), tty: std::io::stderr().is_terminal() };
+    let mut seg = to.new_segment()?;
+    let mut last = Instant::now();
+    for (i, k) in keys.iter().enumerate() {
+        let b = from.read(k)?;
+        if !seg.fits(b.len()) {
+            to.commit(&mut seg)?;
+            seg = to.new_segment()?;
+        }
+        seg.append(k, &b)?;
+        progress.done.fetch_add(b.len() as u64, Ordering::Relaxed);
+        if i % 20000 == 19999 {
+            to.commit(&mut seg)?;
+        }
+        if last.elapsed().as_secs() >= 2 {
+            eprint!("\r  copied {} of {} blobs, {:.2} GiB  ", i + 1, keys.len(), progress.done.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64);
+            last = Instant::now();
+        }
+    }
+    to.commit(&mut seg)?;
+    if !keys.is_empty() {
+        eprintln!("\r  copied {} blobs, {:.2} GiB          ", keys.len(), progress.done.load(Ordering::Relaxed) as f64 / (1u64 << 30) as f64);
+    }
+    Ok(())
+}
+
+/// Writes a product's loose files, `.flavor.info` and `.build.info` row.
+fn install_files(root: &Path, pl: &Plan, store: &Storage, opts: &Options) -> Result<()> {
+    let dir = root.join(pl.p.folder);
     let mut written = 0;
-    for f in &files {
+    for f in &pl.files {
         let dest = local_path(&dir, &f.path);
         if fs::read(&dest).is_ok_and(|b| md5(&b) == f.ckey) {
             continue;
         }
-        let ekey = file_ekeys.get(&f.ckey).with_context(|| format!("{}: not in encoding", f.path))?;
-        let content = blte_decode(&storage.read(ekey)?).with_context(|| f.path.clone())?;
+        let ekey = pl.file_ekeys.get(&f.ckey).with_context(|| format!("{}: not in encoding", f.path))?;
+        let content = blte_decode(&store.read(ekey)?).with_context(|| f.path.clone())?;
         if md5(&content) != f.ckey {
             bail!("{}: content does not match its key", f.path);
         }
         write_atomic(&dest, &content)?;
         written += 1;
     }
-    eprintln!("  wrote {written} loose files to {}", dir.display());
-    write_atomic(&dir.join(".flavor.info"), format!("Product Flavor!STRING:0\n{}\n", p.code).as_bytes())?;
-    write_build_info(root, &live, opts, &live.build_config)?;
-    eprintln!("  {} is at {}", p.name, live.version);
-    Ok(true)
+    if written > 0 {
+        eprintln!("  wrote {written} loose files to {}", dir.display());
+    }
+    write_atomic(&dir.join(".flavor.info"), format!("Product Flavor!STRING:0\n{}\n", pl.p.code).as_bytes())?;
+    write_build_info(root, &pl.live, opts, &pl.live.build_config)?;
+    eprintln!("{} is at {}", pl.p.name, pl.live.version);
+    Ok(())
 }
 
 pub fn status(root: &Path, region: &str) -> Result<()> {

@@ -90,16 +90,15 @@ fn main() -> Result<()> {
         Cmd::Update { products, build, check } => {
             let opts = options(build, *check);
             let root = root()?;
-            for code in products {
-                install::update(&root, install::product(code)?, &opts)?;
-            }
+            let products = products.iter().map(|c| install::product(c)).collect::<Result<Vec<_>>>()?;
+            install::update(&root, &products, &opts)?;
         }
         Cmd::Play { product, build, offline } => {
             let opts = options(build, false);
             let root = root()?;
             let p = install::product(product)?;
             if !offline {
-                install::update(&root, p, &opts)?;
+                install::update(&root, &[p], &opts)?;
             }
             launch::play(&root, p, &opts.arch, &cfg)?;
         }

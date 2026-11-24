@@ -60,11 +60,24 @@ A product whose version and architecture in `.build.info` already match the live
 current in about a second. `--verify` checks every file, which takes a couple of minutes for a full
 install.
 
-An existing install can be reused, for example a `World of Warcraft` folder copied from a Windows PC
-or another Wine prefix. Only what is missing is downloaded. Switching an x86_64 install to `arm64`
-fetches just the ARM64 files.
-
 An interrupted download resumes where it stopped: run the same command again.
+
+## Taking over a Battle.net install
+
+wowupd keeps the game data (`Data/data`) in a store it builds itself. The client won't accept a
+Battle.net store with wowupd's files added to it: it reports *your installation is damaged*. It does
+accept a store built whole.
+
+So the first `update` in a folder Battle.net installed (or one copied from a Windows PC):
+
+- builds a new store for every installed product, copying what the old store has and downloading the rest;
+- renames the old store to `Data/data.battlenet`;
+- writes `.wowupd-store` in the WoW folder.
+
+Delete `data.battlenet` once the games work. To hand the folder back to Battle.net, move it back to
+`Data/data`, remove `.wowupd-store`, and run Battle.net's Scan and Repair.
+
+This also covers switching an x86_64 install to `arm64`: the new store gets the ARM64 files.
 
 ## How it works
 
@@ -77,8 +90,9 @@ An interrupted download resumes where it stopped: run the same command again.
 - **Finding and fetching.** Missing blobs are looked up in the CDN archive indices, which are cached in
   `Data/indices`. They are fetched with merged HTTP range requests, several at a time. Each blob is
   checked against its MD5 encoding key.
-- **Writing the store.** Blobs are appended to new `Data/data/data.NNN` segments, each behind the
-  30-byte header the client expects. A journal makes interrupted runs resumable.
+- **Writing the store.** Blobs are appended to `Data/data/data.NNN` segments, each behind the
+  30-byte header the client expects, with the Agent's two checksums. A journal makes interrupted runs
+  resumable.
 - **Indices.** All sixteen `.idx` files are then rewritten as new versions. Entries the client wrote
   itself are kept: they have no header and are bare BLTE blobs. `shmem` is removed, and the client
   rebuilds it.

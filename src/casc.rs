@@ -47,25 +47,37 @@ pub fn bucket(key: &[u8]) -> u8 {
     (h & 0xf) ^ (h >> 4)
 }
 
-/// The header in front of a blob of `blte_size` bytes whose header sits at `offset` in its segment.
-pub fn entry_header(ekey: &[u8; 16], blte_size: u32, offset: u64) -> [u8; HEADER_SIZE as usize] {
+/// The header in front of a blob of `blte_size` bytes whose header sits at `offset` in `segment`.
+pub fn entry_header(ekey: &[u8; 16], blte_size: u32, segment: u32, offset: u64) -> [u8; HEADER_SIZE as usize] {
+    header(ekey, blte_size, segment, offset, 0)
+}
+
+/// The client checks both checksums: it reports "Missing segment header" and asks for a repair when the
+/// second one is wrong.
+fn header(ekey: &[u8; 16], blte_size: u32, segment: u32, offset: u64, flags: u8) -> [u8; HEADER_SIZE as usize] {
     // The key, reversed; like the index, the Agent keeps only its first 9 bytes and zeroes the rest.
     let mut h = [0u8; HEADER_SIZE as usize];
     for i in 0..KEY_BYTES {
         h[15 - i] = ekey[i];
     }
     h[0x10..0x14].copy_from_slice(&(blte_size + HEADER_SIZE as u32).to_le_bytes());
+    h[0x14] = flags;
     let check_a = hashlittle(&h[..0x16], HEADER_SEED);
     h[0x16..0x1a].copy_from_slice(&check_a.to_le_bytes());
+    // The second checksum works on absolute file positions: bytes fold into lanes by position mod 4, and
+    // the position mixed in is the low 32 bits of the packed index offset (segment << 30 | offset) just
+    // past the header. CascLib's version assumes an aligned header in segment 0.
+    let packed = ((segment as u64) << SEGMENT_BITS) | offset;
+    let lane = |i: usize| (packed as usize + i) & 3;
     let mut folded = [0u8; 4];
     for i in 0..0x1a {
-        folded[i & 3] ^= h[i];
+        folded[lane(i)] ^= h[i];
     }
-    let pos = (offset + HEADER_SIZE) as u32;
-    let mixed = OFFSET_TABLE[(pos & 0xf) as usize] ^ pos;
+    let pos = (packed + HEADER_SIZE) as u32;
+    let mixed = (OFFSET_TABLE[(pos & 0xf) as usize] ^ pos).to_le_bytes();
     for j in 0..4 {
-        let k = (0x1a + j) & 3;
-        h[0x1a + j] = folded[k] ^ (mixed >> (8 * k)) as u8;
+        let k = lane(0x1a + j);
+        h[0x1a + j] = folded[k] ^ mixed[k];
     }
     h
 }
@@ -252,6 +264,36 @@ impl Storage {
         Ok(Storage { dir: dir.to_owned(), entries, versions, journal, next_segment })
     }
 
+    /// The client's `shmem` caches index versions and free space, and `RepairMarker.psv` makes it ask for
+    /// a repair; both go after a change, and the client rebuilds `shmem`.
+    fn remove_client_state(&self) -> Result<()> {
+        for stale in ["shmem", "RepairMarker.psv"] {
+            let p = self.dir.join(stale);
+            if p.exists() {
+                fs::remove_file(p)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn journal_entries(&mut self, list: &[([u8; 16], Loc)]) -> Result<()> {
+        let mut rec = Vec::with_capacity(list.len() * JOURNAL_RECORD);
+        for (ekey, loc) in list {
+            rec.extend_from_slice(ekey);
+            rec.extend_from_slice(&loc.segment.to_le_bytes());
+            rec.extend_from_slice(&loc.offset.to_le_bytes());
+            rec.extend_from_slice(&loc.size.to_le_bytes());
+            self.entries.insert(key9(ekey), *loc);
+        }
+        if self.journal.is_none() {
+            self.journal = Some(OpenOptions::new().append(true).create(true).open(self.dir.join(JOURNAL))?);
+        }
+        let j = self.journal.as_mut().unwrap();
+        j.write_all(&rec)?;
+        j.sync_data()?;
+        Ok(())
+    }
+
     /// Where the BLTE blob of an entry starts and how long it is. Most entries sit behind a 30-byte header
     /// naming their key; some (written by the game client itself) are the bare blob, and their size
     /// counts no header.
@@ -302,6 +344,8 @@ impl Storage {
         }
         let n = self.next_segment;
         self.next_segment += 1;
+        // Unlike the Agent's, these segments have no segment header: in a store wowupd built, the client
+        // doesn't expect one (in a store mixing both it reports "Missing segment header").
         let file = OpenOptions::new().write(true).create(true).truncate(true).open(segment_path(&self.dir, n))?;
         Ok(Segment { number: n, file, end: 0, pending: Vec::new() })
     }
@@ -312,21 +356,8 @@ impl Storage {
             return Ok(());
         }
         seg.file.sync_data()?;
-        let mut rec = Vec::with_capacity(seg.pending.len() * JOURNAL_RECORD);
-        for (ekey, offset, size) in seg.pending.drain(..) {
-            rec.extend_from_slice(&ekey);
-            rec.extend_from_slice(&seg.number.to_le_bytes());
-            rec.extend_from_slice(&offset.to_le_bytes());
-            rec.extend_from_slice(&size.to_le_bytes());
-            self.entries.insert(key9(&ekey), Loc { segment: seg.number, offset, size });
-        }
-        if self.journal.is_none() {
-            self.journal = Some(OpenOptions::new().append(true).create(true).open(self.dir.join(JOURNAL))?);
-        }
-        let j = self.journal.as_mut().unwrap();
-        j.write_all(&rec)?;
-        j.sync_data()?;
-        Ok(())
+        let list: Vec<_> = seg.pending.drain(..).map(|(k, offset, size)| (k, Loc { segment: seg.number, offset, size })).collect();
+        self.journal_entries(&list)
     }
 
     /// Writes every bucket as a new index version, removes the old ones and the journal. The client's
@@ -351,10 +382,7 @@ impl Storage {
             }
             self.versions.insert(b, version);
         }
-        let shmem = self.dir.join("shmem");
-        if shmem.exists() {
-            fs::remove_file(shmem)?;
-        }
+        self.remove_client_state()?;
         self.journal = None;
         fs::remove_file(self.dir.join(JOURNAL))?;
         Ok(())
@@ -375,7 +403,7 @@ impl Segment {
 
     pub fn append(&mut self, ekey: &[u8; 16], blte: &[u8]) -> Result<()> {
         let offset = self.end;
-        self.file.write_all(&entry_header(ekey, blte.len() as u32, offset))?;
+        self.file.write_all(&entry_header(ekey, blte.len() as u32, self.number, offset))?;
         self.file.write_all(blte)?;
         self.end += HEADER_SIZE + blte.len() as u64;
         self.pending.push((*ekey, offset, (HEADER_SIZE as usize + blte.len()) as u32));
@@ -391,19 +419,41 @@ mod tests {
         (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 
-    // Headers written by Blizzard's Agent: (key, entry size, offset, header).
+    // Headers written by Blizzard's Agent: (key, entry size, segment, offset, header).
     #[test]
     fn agent_headers() {
-        for (key, size, offset, want) in [
-            ("00005353f628445600", 9235, 691909257, "0000000000000000564428f653530000132400000000c94bf30821800bd3"),
-            ("0001247736dba21f64", 7916, 85714509, "00000000000000641fa2db3677240100ec1e0000000036e675997b222b89"),
-            ("000180d18404adcac0", 7097, 460179241, "00000000000000c0caad0484d1800100b91b000000008d5625c1bacf1c4f"),
+        for (key, size, segment, offset, want) in [
+            ("00005353f628445600", 9235, 21, 691909257, "0000000000000000564428f653530000132400000000c94bf30821800bd3"),
+            ("0001247736dba21f64", 7916, 7, 85714509, "00000000000000641fa2db3677240100ec1e0000000036e675997b222b89"),
+            ("000180d18404adcac0", 7097, 46, 460179241, "00000000000000c0caad0484d1800100b91b000000008d5625c1bacf1c4f"),
         ] {
             let mut ekey = [0u8; 16];
             ekey[..9].copy_from_slice(&unhex(key));
-            // The last 4 bytes come from a newer Agent than CascLib's formula (table and position mix);
-            // they differ, and the client doesn't seem to check them.
-            assert_eq!(entry_header(&ekey, size - HEADER_SIZE as u32, offset)[..0x1a], unhex(want)[..0x1a]);
+            assert_eq!(entry_header(&ekey, size - HEADER_SIZE as u32, segment, offset).to_vec(), unhex(want));
+        }
+    }
+
+    // The first 480 bytes of an Agent-written data.000.
+    #[test]
+    fn agent_segment_header() {
+        let want = unhex(concat!(
+            "00000000000000228963d707788500041e000000010000296b7ba2dda1e300000000000000228963d7077885000b1e00000001008624f7f31041ef32",
+            "00000000000000228963d7077885000a1e000000010004935ba2b8819ead00000000000000228963d707788500091e000000010052031ecdf1fb8f1a",
+            "00000000000000228963d707788500081e0000000100b55795617c38932b00000000000000228963d7077885000f1e0000000100091f459ddb75756e",
+            "00000000000000228963d7077885000e1e0000000100e92a3dbe5cefcb3400000000000000228963d7077885000d1e00000001005c4b440ac3f539e8",
+            "00000000000000228963d7077885000c1e00000001003f6807f19d94dd6800000000000000228963d707788500031e00000001002abdcda2acd1d563",
+            "00000000000000228963d707788500021e00000001004463c5cef87910c000000000000000228963d707788500011e0000000100658ce8ccd67d791b",
+            "00000000000000228963d707788500001e0000000100a2ed451e6b8a535500000000000000228963d707788500071e0000000100b434357e7657058d",
+            "00000000000000228963d707788500061e0000000100f736b6b142fb503a00000000000000228963d707788500051e00000001005c1025d6d3a75834",
+        ));
+        // 16 empty entries flagged 1; checks both checksums at unaligned offsets.
+        for i in 0..16 {
+            let at = i * HEADER_SIZE as usize;
+            let mut ekey = [0u8; 16];
+            for j in 0..KEY_BYTES {
+                ekey[j] = want[at + 15 - j];
+            }
+            assert_eq!(header(&ekey, 0, 0, at as u64, 1)[..], want[at..at + HEADER_SIZE as usize], "entry {i}");
         }
     }
 
