@@ -1,0 +1,17 @@
+[package]
+name = "wowupd"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+description = "Installs and updates World of Warcraft clients from Blizzard's CDN, without the Battle.net launcher"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+libc = "0.2"
+md-5 = "0.10"
+ureq = "2"
+
+[profile.release]
+debug = "line-tables-only"
