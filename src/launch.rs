@@ -79,6 +79,12 @@ pub fn play(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
     if let Some(prefix) = &cfg.wineprefix {
         cmd.env("WINEPREFIX", prefix);
     }
+    // DXVK and vkd3d-proton log every device feature; `env` lines in the config turn them back on.
+    for (k, v) in [("DXVK_LOG_LEVEL", "none"), ("VKD3D_DEBUG", "none"), ("WINEDEBUG", "-all")] {
+        if std::env::var_os(k).is_none() {
+            cmd.env(k, v);
+        }
+    }
     let mut overrides = std::env::var("WINEDLLOVERRIDES").unwrap_or_default();
     for (k, v) in &cfg.env {
         if k == "WINEDLLOVERRIDES" {
