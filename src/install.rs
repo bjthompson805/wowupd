@@ -108,7 +108,16 @@ fn blob(cdn: &Cdn, storage: &Storage, ekey: &Hash) -> Result<Vec<u8>> {
 #[derive(Clone, Copy)]
 enum Source {
     Archive { archive: usize, offset: u64, size: u64 },
-    Loose,
+    /// `size` is 0 when no index listed the blob.
+    Loose { size: u64 },
+}
+
+impl Source {
+    fn size(&self) -> u64 {
+        match *self {
+            Source::Archive { size, .. } | Source::Loose { size } => size,
+        }
+    }
 }
 
 struct Job {
@@ -129,7 +138,7 @@ fn requests(missing: &HashMap<Hash, Source>) -> Vec<Job> {
     for (k, s) in missing {
         match *s {
             Source::Archive { archive, offset, size } => by_archive.entry(archive).or_default().push((*k, offset, size)),
-            Source::Loose => jobs.push(Job { archive: None, start: 0, len: 0, blobs: vec![(*k, 0, 0)] }),
+            Source::Loose { size } => jobs.push(Job { archive: None, start: 0, len: size, blobs: vec![(*k, 0, size)] }),
         }
     }
     for (archive, mut blobs) in by_archive {
@@ -157,7 +166,7 @@ fn requests(missing: &HashMap<Hash, Source>) -> Vec<Job> {
 /// Downloads `missing` into new segments of `storage`, `jobs` requests at a time.
 fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<Hash, Source>, jobs: usize, report: &Reporter) -> Result<Storage> {
     let work = Mutex::new(requests(missing));
-    let total = missing.values().map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
+    let total = missing.values().map(Source::size).sum();
     let done = AtomicU64::new(0);
     let meter = Mutex::new(Meter::new(Phase::Downloading, total));
     let storage = Mutex::new(storage);
@@ -192,6 +201,9 @@ fn download(cdn: &Cdn, storage: Storage, archives: &[String], missing: &HashMap<
                             seg.as_mut().unwrap().append(&ekey, b)?;
                             if job.archive.is_none() {
                                 done.fetch_add(b.len() as u64, Ordering::Relaxed);
+                                if size == 0 {
+                                    meter.lock().unwrap().grow(b.len() as u64);
+                                }
                             }
                         }
                         if job.archive.is_some() {
@@ -260,7 +272,7 @@ fn locate(cdn: &Cdn, data: &Path, cdn_cfg: &HashMap<String, Vec<String>>, wanted
                     let mut f = found.lock().unwrap();
                     for (k, size, off) in entries {
                         if wanted.contains(&k) {
-                            let src = if is_loose { Source::Loose } else { Source::Archive { archive: i, offset: off as u64, size: size as u64 } };
+                            let src = if is_loose { Source::Loose { size: size as u64 } } else { Source::Archive { archive: i, offset: off as u64, size: size as u64 } };
                             // An archive copy beats a loose one.
                             if matches!(src, Source::Archive { .. }) || !f.contains_key(&k) {
                                 f.insert(k, src);
@@ -508,12 +520,15 @@ fn fetch(root: &Path, mut store: Storage, plans: &[Plan], missing: &HashSet<Hash
     }
     if let (Some(first), false) = (plans.first(), left.is_empty()) {
         // Not in any archive: try them as loose CDN files.
-        found.push((first, Vec::new(), left.iter().map(|k| (*k, Source::Loose)).collect()));
+        found.push((first, Vec::new(), left.iter().map(|k| (*k, Source::Loose { size: 0 })).collect()));
     }
-    let bytes: u64 = found.iter().flat_map(|f| f.2.values()).map(|s| if let Source::Archive { size, .. } = s { *size } else { 0 }).sum();
-    let loose = found.iter().flat_map(|f| f.2.values()).filter(|s| matches!(s, Source::Loose)).count();
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let sources = || found.iter().flat_map(|f| f.2.values());
+    let bytes: u64 = sources().filter(|s| matches!(s, Source::Archive { .. })).map(Source::size).sum();
+    let loose_bytes: u64 = sources().filter(|s| matches!(s, Source::Loose { .. })).map(Source::size).sum();
+    let loose = sources().filter(|s| matches!(s, Source::Loose { .. })).count();
     if !missing.is_empty() {
-        note(&opts.report, format!("download: {:.2} GiB from archives, plus {loose} loose blobs", bytes as f64 / (1u64 << 30) as f64));
+        note(&opts.report, format!("download: {:.2} GiB from archives, plus {loose} loose blobs ({:.2} GiB)", gib(bytes), gib(loose_bytes)));
     }
     if opts.check_only {
         return Ok(None);

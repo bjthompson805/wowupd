@@ -89,6 +89,11 @@ impl Meter {
         Progress { phase: self.phase, done, total: self.total, rate, finished }
     }
 
+    /// Adds bytes whose size was not known when the meter started.
+    pub fn grow(&mut self, bytes: u64) {
+        self.total += bytes;
+    }
+
     /// Sends progress if enough time has passed since the last.
     pub fn update(&mut self, done: u64, report: &Reporter) {
         if self.last_sent.is_some_and(|t| t.elapsed() < INTERVAL) {
