@@ -24,13 +24,20 @@ launcher, only a current install. If the install is out of date, the client says
 When Blizzard's Agent is installed, the client starts it. `wowupd play` stops it from starting
 (`WINEDLLOVERRIDES=agent.exe=d`).
 
-## Building
+## Installing
 
 ```sh
-cargo build --release                     # needs gtk4; --no-default-features builds only the command
-install -m 755 target/release/wowupd target/release/wowupd-gtk ~/.local/bin/
-install -m 644 wowupd.desktop ~/.local/share/applications/
+./install.sh              # packages (gtk4, rust), build, install
+./install.sh --no-system  # build and install only
 ```
+
+Run it as your desktop user from the checkout; it asks doas or sudo only for missing packages. It
+installs `wowupd` and `wowupd-gtk` in `~/.local/bin` and a desktop entry in
+`~/.local/share/applications`, so application launchers list **wowupd**. Run it again after pulling
+to update.
+
+Building by hand: `cargo build --release` (needs gtk4; `--no-default-features` builds only the
+command).
 
 ## The window
 
