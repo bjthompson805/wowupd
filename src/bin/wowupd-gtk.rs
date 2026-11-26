@@ -182,10 +182,26 @@ impl Window {
 
     fn play(self: &Rc<Self>, root: &Path, row: &Rc<Row>) {
         let cfg = self.config.borrow();
-        match launch::spawn(root, row.product, &cfg.arch(), &cfg) {
-            Ok(()) => show_detail(row, &format!("Starting {}…", row.product.name), false),
-            Err(e) => show_detail(row, &format!("{e:#}"), true),
-        }
+        let mut child = match launch::spawn(root, row.product, &cfg.arch(), &cfg) {
+            Ok(c) => c,
+            Err(e) => return show_detail(row, &format!("{e:#}"), true),
+        };
+        let name = row.product.name;
+        show_detail(row, &format!("{name} is running"), false);
+        // Reap the game on a thread (else it stays a zombie) and report its exit back here.
+        let (tx, rx) = async_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _ = tx.send_blocking(child.wait());
+        });
+        let row = row.clone();
+        glib::spawn_future_local(async move {
+            match rx.recv().await {
+                Ok(Ok(st)) if st.success() => show_detail(&row, &format!("{name} exited"), false),
+                Ok(Ok(st)) => show_detail(&row, &format!("{name} exited ({st})"), true),
+                Ok(Err(e)) => show_detail(&row, &format!("lost track of {name}: {e}"), true),
+                Err(_) => {}
+            }
+        });
     }
 
     /// Runs an update on a worker thread; its events come back over a channel. `then_play` starts the game after.

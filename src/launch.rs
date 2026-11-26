@@ -97,12 +97,12 @@ pub fn play(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
     Err(cmd.exec()).context("could not start Wine")
 }
 
-/// Starts the game under Wine in its own session, so it outlives the caller.
-pub fn spawn(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<()> {
+/// Starts the game under Wine in its own process group, so it outlives the caller. The caller must
+/// wait on the returned child, or it stays a zombie after the game exits.
+pub fn spawn(root: &Path, p: &Product, arch: &str, cfg: &Config) -> Result<std::process::Child> {
     let mut cmd = command(root, p, arch, cfg)?;
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0);
-    cmd.spawn().context("could not start Wine")?;
-    Ok(())
+    cmd.spawn().context("could not start Wine")
 }
 
 /// The Wine command for the game. Battle.net's Agent is kept from starting: the client would launch it,
